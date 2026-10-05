@@ -1,0 +1,39 @@
+{
+  "$comment": "GX-9000 fleet comms protocol — binding for all agents on all nodes. Established 2026-08-28 after raul outage (blaster died via session-kill; restored with linger) and phone onboarding (SSH publickey dead-ends; blaster worked instantly).",
+  "protocol_order": [
+    "blaster",
+    "blaster-retry",
+    "tailscale-ssh-failover"
+  ],
+  "blaster": {
+    "port": 8190,
+    "attempts": 2,
+    "retry_delay_s": 2,
+    "timeout_s": 15,
+    "rule": "ALWAYS FIRST. Never skip. Never go straight to SSH."
+  },
+  "ssh": {
+    "mode": "failover-only",
+    "type": "tailscale-network-ssh",
+    "lan_ssh": "forbidden",
+    "rule": "ONLY after blaster fails twice. Log the failover in your session notes. Plain LAN SSH is not part of the fleet."
+  },
+  "users_by_node": {
+    "craig-boone": "boone",
+    "randall-clark": "bazzite",
+    "raul-tejada": "bazzite",
+    "general-lee-oliver": "biron",
+    "mr-new-vegas": "mr.newvegas",
+    "radar-o-reilly": "droid",
+    "dr-julie-farkas": "bazzite",
+    "lt-carrie-boyd": "bazzite",
+    "ranger-lineholm": "bazzite",
+    "chief-hanlon": "bazzite",
+    "colonel-james-hsu": "bazzite"
+  },
+  "health_rules": {
+    "blaster_down": "check user service + enable linger (loginctl enable-linger <user>) — blaster must survive logouts/reboots",
+    "node_unreachable": "ping tailscale IP first, then blaster retry, THEN consider ssh rescue",
+    "after_any_gdm_or_session_restart": "verify blaster returns — session restarts kill user managers"
+  }
+}

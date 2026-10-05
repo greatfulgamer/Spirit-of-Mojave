@@ -1,0 +1,475 @@
+diff --git a/.gitignore b/.gitignore
+index cecad04..02f803d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -72,3 +72,7 @@ fleet/state/task-ledger.json
+ fleet/state/bouncer.log
+ fleet/inbox/*.json
+ fleet/outbox/*.json
++
++# MemPalace per-project files (issue #185)
++mempalace.yaml
++entities.json
+diff --git a/AGENTS.md b/AGENTS.md
+index 84f0b97..6940755 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -348,7 +348,13 @@ bash ~/NCR-RobCo-GX-9000-Mainframe/send-command.sh randall-clark checkpoint '{"m
+ bash ~/NCR-RobCo-GX-9000-Mainframe/send-command.sh list
+ ```
+ 
+-**Available actions:** sync, checkpoint, git-pull, git-push, ping, restart-comfy, shutdown, fleet-chat-send, fleet-chat-list, fleet-chat-read
++**Available actions:** sync, checkpoint, git-pull, git-push, ping, restart-comfy, fleet-chat-send, fleet-chat-list, fleet-chat-read
++
++**Hard restart** (recovers a wedged blaster — NOT a node shutdown):
++```bash
++send-command.sh <target> shutdown '{"force": true, "reason": "wedged daemon"}'
++```
++Requires the `force` flag; refuses otherwise so an exploratory ping can't silence a node. Bounces via systemd and returns in seconds.
+ 
+ ## Fleet Chat — AI Agent Protocol (CRITICAL)
+ 
+diff --git a/blast.py b/blast.py
+index d57b9b4..16041a6 100644
+--- a/blast.py
++++ b/blast.py
+@@ -19,7 +19,7 @@ TIMEOUT = float(__import__("os").environ.get("BLAST_TIMEOUT", "8"))
+ KNOWN_NODES = {
+     "randall-clark": "100.114.132.6",
+     "ranger-andy": "100.127.121.103",
+-    "mr-new-vegas": "100.73.250.34",
++    "mr-new-vegas": "mr-new-vegas",
+     "craig-boone": "100.126.214.59",
+     "dr-julie-farkas": "100.117.180.62",
+     "general-lee-oliver": "100.90.101.88",
+diff --git a/blaster.py b/blaster.py
+index 4e23a8b..4314a0d 100755
+--- a/blaster.py
++++ b/blaster.py
+@@ -20,18 +20,24 @@ STACK = HOME / "NCR-RobCo-GX-9000-Mainframe"
+ HOSTNAME = os.uname().nodename.split(".")[0]
+ 
+ # Trusted Tailscale IPs that can send commands
++# ─────────────────────────────────────────────────────────────────
++# LAW 0: trust is DYNAMIC — every node on this tailnet sharing our
++# UserID is a fleet member and is trusted (see trusted_peers()).
++# This static set survives only as FALLBACK (tailscale CLI down) and
++# for physical-LAN addresses that never appear in `tailscale status`.
+ TRUSTED_PEERS = {
+     "100.114.132.6",   # randall-clark (main box, Tower + LM Studio, fleet authority)
+-    "100.127.121.103", # ranger-andy (always-on farm worker, RX 6700 XT)
++    "100.127.121.103", # raul-tejada (always-on farm worker, RX 6700 XT)
+     "100.123.78.47",   # iphone171 (Pauls phone)
+     "100.84.216.30",   # chief-hanlon (Camp Golf container, Tower coder)
+     "100.92.73.100",   # ranger-lineholm (fleet pack leader)
+     "100.65.120.76",   # colonel-james-hsu (AI container, fleet chat hub)
+     "100.117.180.62",  # dr-julie-farkas (network self-healing)
+     "100.86.252.31",   # lt-carrie-boyd (security validation)
+-    "100.73.250.34",    # mr-new-vegas (fleet radio personality)
++    # NOTE: mr-new-vegas is now MagicDNS-identified. This node accepts the
++    # whole tailnet via TAILSCALE_CGNAT below — no static entry needed.
+     "100.116.83.5",    # pixel-10 (fleet commander mobile)
+-    "100.90.101.88",   # general-lee-oliver (R430 server, P4 GPU) — SAFE
++    "100.93.165.28",   # general-lee-oliver (R430 server, P4 GPU) — SAFE
+     "100.126.214.59",  # craig-boone
+     "10.30.0.58",      # general-lee-oliver eth (LAN)
+     "10.30.0.98",      # craig-boone eth (LAN)
+@@ -40,6 +46,42 @@ TRUSTED_PEERS = {
+     "127.0.0.1",       # localhost
+ }
+ 
++# Physical-LAN peers: invisible to `tailscale status`, always trusted
++LAN_PEERS = {
++    "10.30.0.58", "10.30.0.98", "10.30.0.142", "10.30.0.191",
++    "127.0.0.1",
++}
++
++_TRUST_CACHE = {"ts": 0.0, "peers": None}
++
++def trusted_peers() -> set:
++    """Live fleet trust: every peer on this tailnet with our UserID (LAW 0).
++    Cached 30s. Falls back to the static set if tailscale is unreachable."""
++    now = time.time()
++    cached = _TRUST_CACHE["peers"]
++    if cached is not None and (now - _TRUST_CACHE["ts"]) < 30:
++        return cached
++    peers = set(LAN_PEERS)
++    try:
++        raw = subprocess.run(
++            ["tailscale", "status", "--json"],
++            capture_output=True, text=True, timeout=5,
++        ).stdout
++        netmap = json.loads(raw)
++        self_uid = netmap.get("Self", {}).get("UserID")
++        for node in [netmap.get("Self", {}), *netmap.get("Peer", {}).values()]:
++            if node.get("UserID") != self_uid:
++                continue  # guests / foreign tailnets are NOT fleet
++            for ip in node.get("TailscaleIPs") or []:
++                peers.add(ip)
++    except Exception as e:
++        log.warning(f"dynamic trust unavailable ({e}) — using static fallback")
++        peers |= TRUSTED_PEERS
++    _TRUST_CACHE["ts"] = now
++    _TRUST_CACHE["peers"] = peers
++    return peers
++
++
+ BLASTER_PORT = int(os.getenv("BLASTER_PORT", "8190"))
+ PIDFILE = HOME / ".blaster.pid"
+ 
+@@ -133,9 +175,27 @@ def action_restart_comfy(payload: dict) -> dict:
+     return {"ok": result.returncode == 0, "stdout": "ComfyUI restart issued"}
+ 
+ def action_shutdown(payload: dict) -> dict:
++    """Hard restart of the blaster daemon. Use to recover a wedged process.
++
++    Requires {"force": true} so an exploratory ping/exec can't silence a node.
++    Restarts via systemd and exits NON-ZERO on purpose: os._exit(0) reads as a
++    clean exit, so Restart=on-failure never fires and the node stays dark —
++    which defeats the point of a recovery tool.
++    """
+     reason = payload.get("reason", "no reason given")
+-    log.warning(f"Shutdown requested: {reason}")
+-    os._exit(0)
++    if not payload.get("force"):
++        log.warning(f"Refusing restart without force flag: {reason}")
++        return {"ok": False, "error": "restart requires {\"force\": true} — refusing to bounce a live node",
++                "hint": 'send: shutdown {"force": true, "reason": "wedged daemon"}'}
++    log.warning(f"HARD RESTART requested: {reason}")
++    # Hand off to systemd, then leave. Non-zero exit makes it bounce itself.
++    threading.Thread(
++        target=lambda: (time.sleep(0.5),
++                        subprocess.run(["systemctl", "--user", "restart", "blaster.service"],
++                                       capture_output=True, timeout=15),
++                        os._exit(1)),
++        daemon=True).start()
++    return {"ok": True, "restarting": True, "reason": reason}
+ 
+ # ── Fleet Service Actions ─────────────────────────────
+ 
+@@ -447,10 +507,20 @@ ACTIONS: dict[str, callable] = {
+ 
+ # ── Dispatcher ────────────────────────────────────────
+ 
++BLASTER_TOKEN = os.environ.get("BLASTER_TOKEN", "")
++
++def _token_ok(payload) -> bool:
++    if not BLASTER_TOKEN:
++        return False
++    return payload.get("token") == BLASTER_TOKEN
++
+ def dispatch(action: str, payload: dict, source_ip: str) -> dict:
+-    if source_ip not in TRUSTED_PEERS:
+-        log.warning(f"Rejected command from untrusted peer: {source_ip}")
+-        return {"ok": False, "error": f"Untrusted peer: {source_ip}"}
++    if source_ip not in trusted_peers():
++        if _token_ok(payload):
++            log.info(f"Emergency token-authed command from {source_ip}")
++        else:
++            log.warning(f"Rejected command from untrusted peer: {source_ip}")
++            return {"ok": False, "error": f"Untrusted peer: {source_ip}"}
+     if action not in ACTIONS:
+         return {"ok": False, "error": f"Unknown action: {action}. Available: {list(ACTIONS.keys())}"}
+     log.info(f"Executing '{action}' from {source_ip}")
+@@ -491,13 +561,21 @@ class BlasterHandler:
+             conn.sendall((json.dumps(result) + "\n").encode())
+ 
+ def run_daemon():
++    BLASTER_PORT_V6 = int(os.environ.get("BLASTER_PORT_V6", "8190"))
++    server6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
++    server6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
++    server6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    server6.bind(("::", BLASTER_PORT_V6))
++    server6.listen(10)
++    server6.settimeout(1.0)
++    log.info(f"Listening v6 on port {BLASTER_PORT_V6} (link-local reachable)")
+     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+     server.bind(("0.0.0.0", BLASTER_PORT))
+     server.listen(10)
+     server.settimeout(1.0)
+     log.info(f"Listening on port {BLASTER_PORT} (Tailscale: {_ts_ip()})")
+-    log.info(f"Trusted peers: {len(TRUSTED_PEERS)}")
++    log.info(f"Trusted peers: {len(trusted_peers())} (dynamic fleet trust + LAN)")
+     log.info(f"Available actions: {list(ACTIONS.keys())}")
+     PIDFILE.write_text(str(os.getpid()))
+     running = True
+@@ -509,6 +587,13 @@ def run_daemon():
+     signal.signal(signal.SIGTERM, sig_handler)
+     while running:
+         try:
++            try:
++                conn, addr = server6.accept()
++                threading.Thread(target=BlasterHandler().handle, args=(conn, addr), daemon=True).start()
++            except socket.timeout:
++                pass
++            except OSError:
++                break
+             conn, addr = server.accept()
+             threading.Thread(target=BlasterHandler().handle, args=(conn, addr), daemon=True).start()
+         except socket.timeout:
+@@ -516,6 +601,7 @@ def run_daemon():
+         except OSError:
+             break
+     server.close()
++    server6.close()
+     PIDFILE.unlink(missing_ok=True)
+     log.info("Blaster stopped")
+ 
+diff --git a/farkas-protocol.py b/farkas-protocol.py
+index 8ee141e..8555e09 100755
+--- a/farkas-protocol.py
++++ b/farkas-protocol.py
+@@ -40,7 +40,7 @@ OUTSIDE_CAMP = {
+     "randall-clark":    "100.114.132.6",
+     "ranger-andy":      "100.127.121.103",
+     "ranger-lineholm":  "100.92.73.100",
+-    "mr-new-vegas":     "100.73.250.34",
++    "mr-new-vegas": "mr-new-vegas",
+     "iphone171":        "100.123.78.47",
+ }
+ 
+diff --git a/fleet-chat.py b/fleet-chat.py
+old mode 100644
+new mode 100755
+diff --git a/fleet-roster.json b/fleet-roster.json
+index f2bbe48..a3877c7 100644
+--- a/fleet-roster.json
++++ b/fleet-roster.json
+@@ -38,7 +38,9 @@
+     }
+   },
+   "mr-new-vegas": {
+-    "ip": "100.73.250.34",
++    "ip": "mr-new-vegas",
++    "magicdns": "mr-new-vegas",
++    "note": "Role moved off the retired gaming laptop (100.73.250.34, offline). Identify by MagicDNS name, not address.",
+     "role": "worker",
+     "gpu": "NVIDIA GTX 1060 Mobile (6GB VRAM)",
+     "ram": "8GB",
+diff --git a/fleet/failover/radio-new-vegas.py b/fleet/failover/radio-new-vegas.py
+old mode 100644
+new mode 100755
+diff --git a/julie-farkas-daemon.py b/julie-farkas-daemon.py
+index 57cd284..1289357 100644
+--- a/julie-farkas-daemon.py
++++ b/julie-farkas-daemon.py
+@@ -34,7 +34,7 @@ KNOWN_NODES = {
+     "colonel-james-hsu": "100.65.120.76",
+     "dr-julie-farkas": "127.0.0.1",
+     "lt-carrie-boyd": "100.86.252.31",
+-    "mr-new-vegas": "100.73.250.34",
++    "mr-new-vegas": "mr-new-vegas",
+     "pixel-10": "100.116.83.5",
+ }
+ 
+diff --git a/observation-tower-dev.py b/observation-tower-dev.py
+index 5c2a996..8bc0ea1 100755
+--- a/observation-tower-dev.py
++++ b/observation-tower-dev.py
+@@ -5215,7 +5215,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+         elif parsed.path == "/api/mobile":
+             self._json(200, {
+                 "fleet": "NCR GX-9000",
+-                "tower_url": "http://100.73.250.34:8082",
++                "tower_url": "http://mr-new-vegas:8082",
+                 "opencode_server": {
+                     "host": "randall-clark",
+                     "ip": "100.114.132.6",
+@@ -5223,7 +5223,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                     "auth": "Tailscale — being on tailnet is your credential"
+                 },
+                 "blaster": {"host": "randall-clark", "port": 8190},
+-                "ollama": {"host": "mr-new-vegas", "ip": "100.73.250.34", "port": 11434},
++                "ollama": {"host": "mr-new-vegas", "ip": "mr-new-vegas", "port": 11434},
+                 "fleet_chat": {"host": "colonel-james-hsu", "port": 7976}
+             })
+         else:
+@@ -5268,7 +5268,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                 # OpenCode Mobile app configuration endpoint
+                 self._json(200, {
+                     "fleet": "NCR GX-9000",
+-                    "tower_url": "http://100.73.250.34:8082",
++                    "tower_url": "http://mr-new-vegas:8082",
+                     "opencode_server": {
+                         "host": "randall-clark",
+                         "ip": "100.114.132.6",
+@@ -5276,10 +5276,10 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                         "auth": "Tailscale — being on tailnet is your credential"
+                     },
+                     "blaster": {"host": "randall-clark", "port": 8190},
+-                    "ollama": {"host": "mr-new-vegas", "ip": "100.73.250.34", "port": 11434},
++                    "ollama": {"host": "mr-new-vegas", "ip": "mr-new-vegas", "port": 11434},
+                     "fleet_chat": {"host": "colonel-james-hsu", "port": 7976},
+                     "commands": {
+-                        "identity": "curl -s http://100.73.250.34:8082/api/mobile",
++                        "identity": "curl -s http://mr-new-vegas:8082/api/mobile",
+                         "blaster_ping": "echo 'ping {}' | nc 100.114.132.6 8190",
+                         "fleet_chat": "python3 ~/gx-9000/chat-agent.py"
+                     }
+diff --git a/observation-tower.py b/observation-tower.py
+index 5e78680..07ae57c 100644
+--- a/observation-tower.py
++++ b/observation-tower.py
+@@ -5521,7 +5521,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+         elif parsed.path == "/api/mobile":
+             self._json(200, {
+                 "fleet": "NCR GX-9000",
+-                "tower_url": "http://100.73.250.34:8082",
++                "tower_url": "http://mr-new-vegas:8082",
+                 "opencode_server": {
+                     "host": "randall-clark",
+                     "ip": "100.114.132.6",
+@@ -5529,7 +5529,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                     "auth": "Tailscale — being on tailnet is your credential"
+                 },
+                 "blaster": {"host": "randall-clark", "port": 8190},
+-                "ollama": {"host": "mr-new-vegas", "ip": "100.73.250.34", "port": 11434},
++                "ollama": {"host": "mr-new-vegas", "ip": "mr-new-vegas", "port": 11434},
+                 "fleet_chat": {"host": "colonel-james-hsu", "port": 7976}
+             })
+         else:
+@@ -5567,7 +5567,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                 # OpenCode Mobile app configuration endpoint
+                 self._json(200, {
+                     "fleet": "NCR GX-9000",
+-                    "tower_url": "http://100.73.250.34:8082",
++                    "tower_url": "http://mr-new-vegas:8082",
+                     "opencode_server": {
+                         "host": "randall-clark",
+                         "ip": "100.114.132.6",
+@@ -5575,10 +5575,10 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
+                         "auth": "Tailscale — being on tailnet is your credential"
+                     },
+                     "blaster": {"host": "randall-clark", "port": 8190},
+-                    "ollama": {"host": "mr-new-vegas", "ip": "100.73.250.34", "port": 11434},
++                    "ollama": {"host": "mr-new-vegas", "ip": "mr-new-vegas", "port": 11434},
+                     "fleet_chat": {"host": "colonel-james-hsu", "port": 7976},
+                     "commands": {
+-                        "identity": "curl -s http://100.73.250.34:8082/api/mobile",
++                        "identity": "curl -s http://mr-new-vegas:8082/api/mobile",
+                         "blaster_ping": "echo 'ping {}' | nc 100.114.132.6 8190",
+                         "fleet_chat": "python3 ~/gx-9000/chat-agent.py"
+                     }
+diff --git a/restore-context.sh b/restore-context.sh
+index b8e0f2b..71c5c08 100755
+--- a/restore-context.sh
++++ b/restore-context.sh
+@@ -11,10 +11,17 @@ echo "║        COURIER-1 — CONTEXT RESTORE      ║"
+ echo "╚══════════════════════════════════════════╝"
+ echo ""
+ echo "--- Latest Checkpoint ---"
+-ls -t ~/Obsidian/RobCo-Vault/Checkpoints/*.md 2>/dev/null | head -1 | xargs head -7 2>/dev/null
++# Layer 0 (memory-vault/) is the layer that actually has data.
++# Layer 1 (Obsidian) is Chippy's curated learning layer and is sparse by design.
++# Check both, newest-first, so boot context is never silently empty.
++( ls -t ~/NCR-RobCo-GX-9000-Mainframe/memory-vault/*session-state*.md 2>/dev/null | head -1
++  ls -t ~/Obsidian/RobCo-Vault/Sessions/*.md 2>/dev/null | head -1
++  ls -t ~/Obsidian/RobCo-Vault/Checkpoints/*.md 2>/dev/null | head -1 ) \
++  | head -1 | xargs head -7 2>/dev/null
+ echo ""
+ echo "--- Last Session Continuation ---"
+-SESSION=$(ls -t ~/Obsidian/RobCo-Vault/Sessions/*.md 2>/dev/null | head -1)
++SESSION=$( ( ls -t ~/NCR-RobCo-GX-9000-Mainframe/memory-vault/*session-state*.md 2>/dev/null | head -1
++  ls -t ~/Obsidian/RobCo-Vault/Sessions/*.md 2>/dev/null | head -1 ) | head -1)
+ if [ -n "$SESSION" ]; then
+   head -40 "$SESSION"
+   echo ""
+diff --git a/spare-tire.py b/spare-tire.py
+index ca6abbf..b54bf35 100644
+--- a/spare-tire.py
++++ b/spare-tire.py
+@@ -52,7 +52,7 @@ DEFAULT_FLEET = {
+     "colonel-james-hsu": {"ip": "100.65.120.76", "role": "container"},
+     "dr-julie-farkas": {"ip": "100.117.180.62", "role": "self-healing"},
+     "lt-carrie-boyd": {"ip": "100.86.252.31", "role": "security"},
+-    "mr-new-vegas": {"ip": "100.73.250.34", "role": "radio-tower"},
++    "mr-new-vegas": {"ip": "mr-new-vegas", "role": "radio-tower"},
+     "craig-boone": {"ip": "100.126.214.59", "role": "worker"},
+ }
+ 
+diff --git a/tools/fleet-chat-launcher.sh b/tools/fleet-chat-launcher.sh
+index 210b6ac..108e9a6 100755
+--- a/tools/fleet-chat-launcher.sh
++++ b/tools/fleet-chat-launcher.sh
+@@ -19,7 +19,7 @@ CANDIDATES=(
+   "100.65.120.76"   # colonel-james-hsu (primary hub)
+   "100.84.216.30"   # chief-hanlon (failover)
+   "100.114.132.6"   # randall-clark (fleet authority)
+-  "100.73.250.34"    # mr-new-vegas (tower host)
++  "mr-new-vegas"        # mr-new-vegas (tower host, MagicDNS)
+   "100.117.180.62"  # dr-julie-farkas (self-healing)
+   "100.86.252.31"   # lt-carrie-boyd
+   "100.127.121.103" # ranger-andy
+diff --git a/tools/fleet-roster.json b/tools/fleet-roster.json
+index ce3103a..665d8f1 100644
+--- a/tools/fleet-roster.json
++++ b/tools/fleet-roster.json
+@@ -196,7 +196,8 @@
+       ]
+     },
+     "mr-new-vegas": {
+-      "ip": "100.73.250.34",
++      "ip": "mr-new-vegas",
++      "note": "Role moved off the retired gaming laptop (100.73.250.34). MagicDNS is canonical.",
+       "label": "Mr. New Vegas — Fleet Radio",
+       "theme": "catppuccin",
+       "primary_role": "Fleet Radio Personality, LM Studio Headless (experimental)",
+diff --git a/tools/fleet-text.py b/tools/fleet-text.py
+index 8a7763d..387cdd3 100755
+--- a/tools/fleet-text.py
++++ b/tools/fleet-text.py
+@@ -7,12 +7,12 @@ Usage:
+   fleet-text.py "message text"
+   fleet-text.py "message" --title "RANGER" --priority 4 --topic robco-alerts
+ 
+-Env overrides: NTFY_SERVER (default 100.73.250.34:2586 = mr-new-vegas),
++Env overrides: NTFY_SERVER (default mr-new-vegas:2586 = mr-new-vegas),
+                NTFY_TOPIC (default robco-alerts)
+ """
+ import argparse, hashlib, os, sys, urllib.request
+ 
+-DEFAULT_SERVER = os.environ.get("NTFY_SERVER", "100.73.250.34:2586")
++DEFAULT_SERVER = os.environ.get("NTFY_SERVER", "mr-new-vegas:2586")
+ DEFAULT_TOPIC = os.environ.get("NTFY_TOPIC", "robco-alerts")
+ 
+ 
+diff --git a/tools/recall.sh b/tools/recall.sh
+index f0bad20..638216b 100755
+--- a/tools/recall.sh
++++ b/tools/recall.sh
+@@ -16,7 +16,7 @@
+ 
+ set -euo pipefail
+ 
+-TOWER_URL="${RECALL_TOWER_URL:-http://100.73.250.34:8082}"
++TOWER_URL="${RECALL_TOWER_URL:-http://mr-new-vegas:8082}"
+ JAMES_IP="100.65.120.76"
+ RECALL_PORT="8195"
+ BLASTER_PORT="8190"
+diff --git a/tools/red_phone.sh b/tools/red_phone.sh
+index a139441..69e8515 100755
+--- a/tools/red_phone.sh
++++ b/tools/red_phone.sh
+@@ -3,7 +3,7 @@
+ # Usage: red_phone.sh "TITLE" "BODY" [priority]
+ # Every node calls this for actionable decisions ONLY. Fleet chatter stays in robco-alerts.
+ set -euo pipefail
+-NTFY_HOST="${NTFY_HOST:-100.73.250.34:2586}"
++NTFY_HOST="${NTFY_HOST:-mr-new-vegas:2586}"
+ RED_PHONE_TOPIC="${RED_PHONE_TOPIC:-redphone-paul-nm0rzt}"
+ TITLE="${1:-RED PHONE}"; BODY="${2:-}"; PRIO="${3:-5}"
+ curl -s -m 5 -o /dev/null -w "%{http_code}" \
+diff --git a/total-recall.py b/total-recall.py
+index 31fe393..c813410 100755
+--- a/total-recall.py
++++ b/total-recall.py
+@@ -42,7 +42,7 @@ FLEET = {
+     "chief-hanlon": "100.84.216.30",
+     "colonel-james-hsu": "100.65.120.76",
+     "test-node": "100.117.180.62",
+-    "mr-new-vegas": "100.73.250.34",
++    "mr-new-vegas": "mr-new-vegas",
+     "lt-boyd": "100.86.252.31",
+ }
+ 

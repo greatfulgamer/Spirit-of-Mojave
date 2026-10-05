@@ -1,0 +1,17 @@
+{
+  "comment": "Example model/node matrix. Edit to match your live fleet. Run each cell to find what really works.",
+  "nodes": {
+    "oliver": "localhost:11434",
+    "raul-cuda": "100.127.121.103:11434",
+    "raul-vulkan": "100.127.121.103:11435",
+    "randall": "localhost:11434"
+  },
+  "matrix": [
+    {"node": "oliver", "model": "qwen3.6:35b-a3b", "note": "22GB spills on 16GB VRAM"},
+    {"node": "oliver", "model": "qwen3:14b",      "note": "fits 16GB w/ headroom"},
+    {"node": "oliver", "model": "qwen3:8b",       "note": "fast, lots of headroom"},
+    {"node": "raul-cuda", "model": "qwen3:8b",    "note": "P4 lane"},
+    {"node": "raul-vulkan", "model": "qwen3.5:9b","note": "RX6700 lane"},
+    {"node": "randall", "model": "qwen3.5:4b",    "note": "4050 fast lane"}
+  ]
+}
